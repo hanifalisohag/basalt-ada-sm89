@@ -81,6 +81,7 @@ static mmq_q8_1_ds_layout mmq_get_q8_1_ds_layout(const ggml_type type_x) {
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_NVFP4:
             return MMQ_Q8_1_DS_LAYOUT_D4;
         default:
@@ -345,6 +346,11 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
         case GGML_TYPE_MXFP4:   // one float scale per 32 values: the IQ4_NL tile layout and dot
             return ggml_cuda_mmq_util_funcs(
                 ggml_cuda_mmq_load_tiles_mxfp4<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_MXFP8:   // one float scale per 32 values: the Q8_0 tile layout and dot
+            return ggml_cuda_mmq_util_funcs(
+                ggml_cuda_mmq_load_tiles_mxfp8<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
         case GGML_TYPE_NVFP4:   // one scale per 16 values: the Q3_K-layout dot
@@ -1075,5 +1081,6 @@ MMQ_INSTANCES(extern, GGML_TYPE_IQ3_XXS);
 MMQ_INSTANCES(extern, GGML_TYPE_IQ3_S);
 MMQ_INSTANCES(extern, GGML_TYPE_IQ4_NL);
 MMQ_INSTANCES(extern, GGML_TYPE_MXFP4);
+MMQ_INSTANCES(extern, GGML_TYPE_MXFP8);
 MMQ_INSTANCES(extern, GGML_TYPE_IQ4_XS);
 MMQ_INSTANCES(extern, GGML_TYPE_NVFP4);

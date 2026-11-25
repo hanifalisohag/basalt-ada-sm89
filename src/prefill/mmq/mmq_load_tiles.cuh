@@ -125,6 +125,134 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// MXFP8: 128 E4M3 codes in four 32-value sub-blocks, each with a UE8M0 scale. The MMQ tile holds one int8 per code
+// and one float scale per 32-value sub-block (the Q8_0 granularity), so the Q8_0 tile layout and dot carry it. Each
+// sub-block is quantized to int8 against its own amax; the sub-block's UE8M0 scale times that amax/127 is the float
+// the epilogue multiplies by.
+static __device__ __forceinline__ float ggml_cuda_mmq_e4m3_to_float(uint8_t b) {
+    const int sign = (b >> 7) & 1;
+    const int exp  = (b >> 3) & 0xF;
+    const int mant =  b       & 0x7;
+    if (exp == 0xF && mant == 0x7) {
+        return 0.0f;   // E4M3's NaN code, the table's 0
+    }
+    const float m = exp == 0 ? (float) mant / 8.0f * 0.015625f : (1.0f + (float) mant / 8.0f) * exp2f((float) (exp - 7));
+    return sign ? -m : m;
+}
+
+static __device__ __forceinline__ float ggml_cuda_mmq_ue8m0_to_float(uint8_t u) {
+    if (u == 0xFFu) {
+        return 0.0f;
+    }
+    return u == 0u ? 0.00390625f : exp2f((float) ((int) u - 127));
+}
+
+template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_mxfp8(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+
+    // The Q8_0 tile layout: 32 threads cover one MMQ_ITER_K (64) step, thread txi writing the 4 codes of Q8_0-block
+    // kbx = txi/QI_MXFP8 at position txi and of block kbx+4 at MMQ_TILE_NE_K+txi. A Q8_0 block is 32 values, so the
+    // 8 blocks of the tile are the 2 MXFP8 blocks' 4 sub-blocks each: block kbx/4, sub-block kbx%4.
+    constexpr int threads_per_row = 32;
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI_MXFP8;   // 0..3: the sub-block within MXFP8 block 0
+    const int kqsx = txi % QI_MXFP8;   // 0..7: the 4 codes [4*kqsx, 4*kqsx+4) of that sub-block
+
+    // The sub-block's 32 codes are split over 8 threads (4 each); the amax needs a shuffle over those 8.
+    const int lane_in_sub = txi % QI_MXFP8;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i*stride;
+
+        // Block 0's sub-block `kbx`, codes [4*kqsx, 4*kqsx+4).
+        const uint8_t * qs0 = bxi[0].qs + QK_MXFP8_SUB*kbx + 4*kqsx;
+        // Block 1's sub-block `kbx`, codes [4*kqsx, 4*kqsx+4).
+        const uint8_t * qs1 = bxi[1].qs + QK_MXFP8_SUB*kbx + 4*kqsx;
+
+        float v0[4], v1[4];
+        float amax0 = 0.0f, amax1 = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            v0[j] = ggml_cuda_mmq_e4m3_to_float(qs0[j]);
+            v1[j] = ggml_cuda_mmq_e4m3_to_float(qs1[j]);
+            amax0 = fmaxf(amax0, fabsf(v0[j]));
+            amax1 = fmaxf(amax1, fabsf(v1[j]));
+        }
+        // Reduce the amax over the 8 threads of the sub-block (lanes 0..7 within the group of 8).
+#pragma unroll
+        for (int off = 1; off < QI_MXFP8; off <<= 1) {
+            amax0 = fmaxf(amax0, __shfl_xor_sync(0xFFFFFFFF, amax0, off));
+            amax1 = fmaxf(amax1, __shfl_xor_sync(0xFFFFFFFF, amax1, off));
+        }
+        (void) lane_in_sub;
+
+        const float scale0 = amax0 > 0.0f ? amax0 / 127.0f : 0.0f;
+        const float scale1 = amax1 > 0.0f ? amax1 / 127.0f : 0.0f;
+        const float inv0   = scale0 > 0.0f ? 1.0f / scale0 : 0.0f;
+        const float inv1   = scale1 > 0.0f ? 1.0f / scale1 : 0.0f;
+
+        int q0[4], q1[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            q0[j] = (int) lrintf(v0[j] * inv0);
+            q1[j] = (int) lrintf(v1[j] * inv1);
+        }
+
+        // Pack the 4 int8 into one int, in the Q8_0 tile's order.
+        const int packed0 = (q0[0] & 0xFF) | ((q0[1] & 0xFF) << 8) | ((q0[2] & 0xFF) << 16) | ((q0[3] & 0xFF) << 24);
+        const int packed1 = (q1[0] & 0xFF) | ((q1[1] & 0xFF) << 8) | ((q1[2] & 0xFF) << 16) | ((q1[3] & 0xFF) << 24);
+
+        x_qs[i*sram_stride + 0             + txi] = packed0;
+        x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = packed1;
+    }
+
+    // One float per 32-value sub-block: the UE8M0 scale times the int8 quantization step.
+    constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI_MXFP8;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        if (fallback) {
+            i = min(i, i_max);
+        }
+
+        // kbxd (0..7) is the sub-block within the 256-value tile: block kbxd/4, sub-block kbxd%4.
+        const int blk = kbxd / 4;
+        const int sub = kbxd % 4;
+
+        const block_mxfp8 * bxi = (const block_mxfp8 *) x + kbx0 + i*stride + blk;
+        const uint8_t * qs = bxi->qs + QK_MXFP8_SUB*sub;
+
+        // Recompute the sub-block amax for the scale (cheap: 32 table lookups).
+        float amax = 0.0f;
+#pragma unroll
+        for (int j = 0; j < QK_MXFP8_SUB; ++j) {
+            amax = fmaxf(amax, fabsf(ggml_cuda_mmq_e4m3_to_float(qs[j])));
+        }
+        const float step = amax > 0.0f ? amax / 127.0f : 0.0f;
+
+        x_df[i*sram_stride + kbxd] = ggml_cuda_mmq_ue8m0_to_float(bxi->d[sub]) * step;
+    }
+}
+
 // IQ1_S: eight grid values per call from the 11-bit index, one 3-bit scale and one grid shift per 32 values; the shift
 // term rides in the half2 (scale, scale*delta) the q8_1 x q8_1 dot reads.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_iq1_s(

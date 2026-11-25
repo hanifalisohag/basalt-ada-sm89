@@ -176,6 +176,11 @@ typedef struct {
 } block_mxfp8;
 static_assert(sizeof(block_mxfp8) == QK_MXFP8 / QK_MXFP8_SUB + QK_MXFP8, "wrong mxfp8 block size/padding");
 
+// The MMQ tile traits: one int8 per E4M3 code, one float scale per 32-value sub-block (the Q8_0 granularity), so the
+// Q8_0 tile layout and dot carry it.
+#define QR_MXFP8 4
+#define QI_MXFP8 (QK_MXFP8 / (4 * QR_MXFP8))
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
