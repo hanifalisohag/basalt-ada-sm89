@@ -578,14 +578,29 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
         DecRecArgs b = a;
         float* raw = a.o ? a.o : a.y;
         const bool owned = !raw;
-        if (owned) cudaMalloc(&raw, (size_t) n_tok * a.h_v * S * sizeof(float));
+        // The scratch is cached, not malloc'd per call: this runs inside a CUDA graph capture, where cudaMalloc,
+        // cudaFree and cudaStreamSynchronize are all illegal.  The buffer is grown once, outside capture.
+        static float* scratch = nullptr;
+        static size_t scratch_bytes = 0;
+        if (owned) {
+            const size_t need = (size_t) n_tok * a.h_v * S * sizeof(float);
+            if (need > scratch_bytes) {
+                if (scratch) cudaFree(scratch);
+                scratch = nullptr;
+                scratch_bytes = 0;
+                if (cudaMalloc(&scratch, need) != cudaSuccess) {
+                    basalt::log::error("basalt", "dec_gdn_rec: scratch");
+                    std::exit(1);
+                }
+                scratch_bytes = need;
+            }
+            raw = scratch;
+        }
         b.o = raw;
         by_width<SplitK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, b, n_tok); });
         const cudaError_t e0 = cudaGetLastError();
         if (e0 != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e0)); std::exit(1); }
         dec_gdn_rec_norm(b, n_tok, stream);
-        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
-        if (owned) cudaFree(raw);
     }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e)); std::exit(1); }

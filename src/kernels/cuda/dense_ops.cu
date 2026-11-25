@@ -916,14 +916,17 @@ void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, cons
     }
 #if GP_HOST_NO_CLUSTERS
     else {
-        float* scratch = nullptr;
+        static float* scratch = nullptr;
+        static size_t scratch_bytes = 0;
         const size_t bytes = (size_t) tiles * GP_S * (GP_TT * GP_LD) * sizeof(float);
-        if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
+        if (bytes > scratch_bytes) {
+            if (scratch) cudaFree(scratch);
+            if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
+            scratch_bytes = bytes;
+        }
         gdn_gating_proj_kernel<float><<<dim3(tiles, 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
             x, w_ab, dt, ssm_a, scratch, beta, T, K);
         gdn_gating_proj_reduce_kernel<<<dim3(tiles), 128, 0, (cudaStream_t) stream>>>(scratch, dt, ssm_a, gate, beta, T);
-        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
-        cudaFree(scratch);
     }
 #endif
     check("gdn_gating_proj");
@@ -942,14 +945,18 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
     }
 #if GP_HOST_NO_CLUSTERS
     else {
-        float* scratch = nullptr;
+        // The scratch is cached: cudaMalloc and cudaStreamSynchronize are not allowed while a graph is capturing.
+        static float* scratch = nullptr;
+        static size_t scratch_bytes = 0;
         const size_t bytes = (size_t) tiles * GP_S * (GP_TT * GP_LD) * sizeof(float);
-        if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
+        if (bytes > scratch_bytes) {
+            if (scratch) cudaFree(scratch);
+            if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
+            scratch_bytes = bytes;
+        }
         gdn_gating_proj_kernel<__nv_bfloat16><<<dim3(tiles, 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), w_ab, dt, ssm_a, scratch, beta, T, K);
         gdn_gating_proj_reduce_kernel<<<dim3(tiles), 128, 0, (cudaStream_t) stream>>>(scratch, dt, ssm_a, gate, beta, T);
-        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
-        cudaFree(scratch);
     }
 #endif
     check("gdn_gating_proj");

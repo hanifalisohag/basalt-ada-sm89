@@ -111,14 +111,18 @@ Ref reference(const std::vector<float>& w, const std::vector<float>& x, int64_t 
     return r;
 }
 
+#if !defined(BASALT_ADA)
 int bench();
+#endif
 
 }  // namespace
 
 int main(int argc, char** argv) {
     int ndev = 0;
     if (cudaGetDeviceCount(&ndev) != cudaSuccess || ndev == 0) return 77;
+#if !defined(BASALT_ADA)
     if (argc > 1 && std::strcmp(argv[1], "--bench") == 0) return bench();
+#endif
 
     const int64_t R = 512, K = 1280, T = 1100, T2 = 1000;   // R a multiple of 256: the SwiGLU output is quantized again
     std::mt19937 rng(11);
@@ -265,6 +269,7 @@ template <class F> float time_ms(F&& f, int iters = 20) {
     return ms / iters;
 }
 
+#if !defined(BASALT_ADA)
 std::vector<uint8_t> bench_planes(int64_t rows, int64_t K) {
     std::vector<uint8_t> w(np::bytes(rows, K));
     const size_t so = np::scale_offset(rows, K);
@@ -355,5 +360,6 @@ int bench() {
     }
     return rc;
 }
+#endif   // !BASALT_ADA
 
 }  // namespace

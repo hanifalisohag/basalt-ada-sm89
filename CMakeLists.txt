@@ -1913,7 +1913,9 @@ target_include_directories(window_gemm PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/includ
 target_link_libraries(window_gemm PUBLIC core ${_gpu_runtime_target})
 add_library(prefill_fp4 STATIC src/prefill/moe_fp4.cu)
 if(BASALT_ADA)
-  # moe_fp4.cu keeps its host size helpers and drops the sm_120a block-scaled mma; fp4_dense.cu is sm_120a only
+  # moe_fp4.cu keeps its host size helpers and drops the sm_120a block-scaled mma; fp4_dense.cu is sm_120a only, so
+  # the Ada build gets fp4_dense_ada.cu, the same API on mma.m16n8k16.bf16 (window_gemm.cuh's decode).
+  target_sources(prefill_fp4 PRIVATE src/prefill/fp4_dense_ada.cu)
   set_target_properties(prefill_fp4 PROPERTIES CUDA_ARCHITECTURES 89)
 else()
   target_sources(prefill_fp4 PRIVATE src/prefill/fp4_dense.cu)
@@ -2018,6 +2020,12 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_mmq_mxfp8_test PRIVATE mmq ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_mmq_mxfp8_test COMMAND prefill_mmq_mxfp8_test --no-bench)
   set_tests_properties(prefill_mmq_mxfp8_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+  # the dense W4A4 product (prefill::fp4_dense) against a double reference: the plain product, the Add epilogue and
+  # the SwiGLU product; a token's row is the same bits at 1, 1000 and 1100 tokens
+  add_executable(fp4_dense_tma_test tests/kernels/fp4_dense_tma_test.cpp)
+  target_link_libraries(fp4_dense_tma_test PRIVATE prefill_fp4 kernels ${_gpu_runtime_target})
+  basalt_gpu_test(NAME fp4_dense_tma_test COMMAND fp4_dense_tma_test)
+  set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
 endif()
 if(BUILD_TESTING)
   # NVFP4 block decode against the E2M1/UE4M3 spec (exhaustive) and ggml's row dequantizer; with an experts.bin,
@@ -2034,11 +2042,6 @@ if(BUILD_TESTING)
   target_link_libraries(prefill_hc_up_mix_test PRIVATE model_qwen4exp_prefill model_qwen4exp_kernels ${_gpu_runtime_target})
   basalt_gpu_test(NAME prefill_hc_up_mix_test COMMAND prefill_hc_up_mix_test --no-bench)
   set_tests_properties(prefill_hc_up_mix_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
-  # the TMA dense W4A4 product against a double reference, rows bitwise at any chunk length; --bench for TFLOP/s
-  add_executable(fp4_dense_tma_test tests/kernels/fp4_dense_tma_test.cpp)
-  target_link_libraries(fp4_dense_tma_test PRIVATE prefill_fp4 kernels ${_gpu_runtime_target})
-  basalt_gpu_test(NAME fp4_dense_tma_test COMMAND fp4_dense_tma_test)
-  set_tests_properties(fp4_dense_tma_test PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300)
   # the SwiGLU epilogue's branch-free SiLU quotient against the plain expression on every float (built as the product is)
   add_executable(silu_parity tests/kernels/silu_parity.cu)
   set_target_properties(silu_parity PROPERTIES CUDA_ARCHITECTURES ${BASALT_CUDA_ARCH_A})
