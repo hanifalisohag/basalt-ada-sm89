@@ -87,6 +87,18 @@ Ada (see [Get the pack](#get-the-pack)).
 bin/basalt serve --config basalt_config_mx8.json --python .venv/Scripts/python.exe
 ```
 
+Those two keep a long context (589,824 tokens) and spill the experts the card cannot hold into RAM, computing them on
+the CPU. For the fastest decode, `basalt_config_dq8_fullgpu.json` and `basalt_config_mx8_fullgpu.json` instead keep
+**every expert on the card** and no RAM copy: a 131,072-token context, which is the largest that fits beside all
+14.7 GiB of experts on a 24 GB card. Decode runs about 150 tok/s (DQ8) and 156 tok/s (MX8) with a 100% expert-cache
+hit and no PCIe traffic, against the RAM-spill configs' slower CPU-computed experts. Use them when the context fits;
+use the long-context configs when it does not.
+
+```sh
+bin/basalt serve --config basalt_config_dq8_fullgpu.json --python .venv/Scripts/python.exe
+bin/basalt serve --config basalt_config_mx8_fullgpu.json --python .venv/Scripts/python.exe
+```
+
 Model paths in the file are relative to the file itself. The server listens on 127.0.0.1:8080 and speaks the OpenAI and
 Anthropic APIs. The `--python` flag points at a Python with `requirements.txt` installed (a venv is fine); the server uses it
 for tokenizing and the web UI. Then:
