@@ -54,8 +54,8 @@ RTX 4090 (24 GB) with room for the context.
 **Use the DQ8 pack on sm_89.** The MX8 pack (`Inkling-2-Mini-NVFP4-MX8.basalt`, 19.6 GB) stores its experts as MXFP8, which
 this fork runs only on Blackwell: the MXFP8 block-scaled tensor-core kernel is sm_120a, and the portable MMQ path has no
 MXFP8 tile, so an MX8 pack **fails to load on sm_89** with `the prompt path's MMQ has no tile for type 46 at 2304 rows`.
-Upstream reads prompts about 5% faster with MX8 on a Blackwell card; that does not apply here. The `hf download` line for it
-is kept below for a Blackwell machine.
+Upstream's MX8 speedup is a Blackwell result and does not apply here. The `hf download` line for it is kept below for a
+Blackwell machine.
 
 ### Run
 
