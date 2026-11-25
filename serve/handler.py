@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import select
 import socket
@@ -15,6 +16,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
 from serve.api import responses as responses_api
+from serve.api.logs import stream_logs
 from serve.api.responses import error_body as responses_error_body
 from serve import ROOT
 from serve.api.anthropic import anthropic_collect, anthropic_events
@@ -34,6 +36,7 @@ from serve.router import Router
 from serve.service import LOG_FIRST_LINES, LOG_MAX_LINES, QUEUE_BEAT_S, Service, _debug_req
 from serve.api.structured import anthropic_format, check_format
 from serve.util.text import stop_strings
+from serve.util.ui_state import UIState, stream_state
 
 
 CONTROL_BODY_MAX = 64 << 10                 # the unused body of /load and /unload
@@ -46,6 +49,9 @@ TURN_POLL_S = 0.5                           # how soon a request waiting for its
 # per-read deadline, not a total one - a slow client that keeps sending bytes is never cut off. A header read that
 # expires is ended by handle_one_request itself; a body that stops arriving is the 408 in _body.
 HTTP_BODY_S = 60.0
+# Anthropic clients add /v1/messages to their base URL themselves, so a base URL that already ends in /v1 makes them
+# post /v1/v1/messages. These two paths mean the same as the real ones; nothing else is aliased.
+V1_V1_ALIASES = {"/v1/v1/messages": "/v1/messages", "/v1/v1/messages/count_tokens": "/v1/messages/count_tokens"}
 
 
 class BadBody(Exception):
@@ -54,6 +60,12 @@ class BadBody(Exception):
     def __init__(self, status: int, message: str):
         super().__init__(message)
         self.status = status
+
+
+def request_path(target: str) -> str:
+    """The route of a request target: no query, no trailing slash, and a doubled /v1 of the two Anthropic paths undone."""
+    path = target.split("?")[0].rstrip("/")
+    return V1_V1_ALIASES.get(path, path)
 
 
 def _size_text(n: int) -> str:
@@ -68,6 +80,7 @@ def make_handler(target: Service | Router):
         protocol_version = "HTTP/1.0"                       # SSE ends by closing the connection
         timeout = HTTP_BODY_S                               # StreamRequestHandler.setup puts it on the connection:
         # every header, body read and write carries the deadline, so no half-open client holds a thread forever
+        disable_nagle_algorithm = True                      # streamed events go at once: no waiting for a coalesced segment
 
         watch_done = None                                   # stops this request's disconnect watcher
         cancel = None                                       # set when the client left
@@ -294,7 +307,7 @@ def make_handler(target: Service | Router):
 
         def _stream_error(self, obj) -> None:
             """An error after the stream's headers went out (a request that waited for a swap), in the API's own form."""
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             err = obj.get("error") if isinstance(obj.get("error"), dict) else {"message": str(obj)}
             if path == "/v1/messages":
                 data = b"event: error\ndata: " + json.dumps({"type": "error", "error": err}, ensure_ascii=False).encode() + b"\n\n"
@@ -331,7 +344,7 @@ def make_handler(target: Service | Router):
             return False
 
         def do_GET(self):
-            path = self.path.split("?")[0].rstrip("/")
+            path = request_path(self.path)
             if path.startswith("/fonts/"):
                 name = path[len("/fonts/"):]
                 f = ROOT / "serve" / "web" / "fonts" / name
@@ -365,7 +378,27 @@ def make_handler(target: Service | Router):
                 return
             if path == "/metrics":
                 if self._authorized():
-                    name = parse_qs(urlsplit(self.path).query).get("model", [None])[0]
+                    qs = parse_qs(urlsplit(self.path).query)
+                    name = qs.get("model", [None])[0]
+                    fmt = qs.get("format", [None])[0]
+                    from serve.prometheus import CONTENT_TYPE as PROM_CT, render_prometheus, wants_prometheus
+                    if wants_prometheus(self.headers.get("Accept"), fmt):
+                        if name is not None:
+                            svcs = [router.service_for(name)]
+                            if svcs[0] is None:
+                                self._json(404, {"error": {"message": "model not found"}})
+                                return
+                        else:
+                            svcs = list(router.services) if hasattr(router, "services") else [router.shown()]
+                        entries = [(router.metrics(s), s.prom_snapshot()) for s in svcs]
+                        body = render_prometheus(entries).encode("utf-8")
+                        self.send_response(200)
+                        self.send_header("Content-Type", PROM_CT)
+                        self.send_header("Cache-Control", "no-cache")
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
                     shown = router.shown() if name is None else router.service_for(name)
                     if shown is None:
                         self._json(404, {"error": {"message": "model not found"}})
@@ -374,6 +407,12 @@ def make_handler(target: Service | Router):
             elif path == "/api/logs":
                 if self._authorized():
                     self._logs()
+            elif path == "/api/logs/stream":
+                if self._authorized():
+                    stream_logs(self, svc.logs)
+            elif path == "/api/state/stream":
+                if self._authorized():
+                    stream_state(self, self.server.ui_state)
             elif path == "":
                 body = (ROOT / "serve" / "web" / "index.html").read_bytes()
                 self.send_response(200)
@@ -425,7 +464,7 @@ def make_handler(target: Service | Router):
         def do_POST(self):
             if not self._authorized():
                 return
-            path = self.path.split("?")[0].rstrip("/")   # clients post /v1/messages?beta=true
+            path = request_path(self.path)   # clients post /v1/messages?beta=true
             if path.startswith("/v1/") and self._foreign_page():
                 return
             if path in ("/unload", "/load") and not self._control_body():
@@ -462,7 +501,7 @@ def make_handler(target: Service | Router):
                     self._json(404, responses_error_body("this server keeps no responses (stateless); send the "
                                                          "whole conversation to POST /v1/responses", code="not_found"))
                     return
-                if path in ("/v1/load", "/v1/unload"):
+                if path in ("/v1/load", "/v1/unload", "/models/load", "/models/unload"):
                     if not self._own_page("the model can be loaded or unloaded"):
                         return
                     target = router.shown() if req.get("model") is None else router.service_for(req["model"])
@@ -470,7 +509,7 @@ def make_handler(target: Service | Router):
                         self._json(404, {"error": {"message": "model not found"}})
                         return
                     self.svc = target
-                    if path == "/v1/unload":
+                    if path in ("/v1/unload", "/models/unload"):
                         result = target.unload()
                         if result == "busy":
                             raise ModelBusy("a request is running or queued")
@@ -492,6 +531,52 @@ def make_handler(target: Service | Router):
                             target.fifo.release()
                         result = "loaded"
                     self._json(200, {"status": result, **target.v1_status()})
+                    return
+                if path == "/api/pricing":
+                    if not self._own_page("pricing can be changed"):
+                        return
+                    shown = router.shown()
+                    changed = []
+                    for field, attr in (("cost_input_per_million", "cost_input_per_million"),
+                                        ("cost_output_per_million", "cost_output_per_million"),
+                                        ("cost_cache_write_per_million", "cost_cache_write_per_million"),
+                                        ("cost_cache_hit_per_million", "cost_cache_hit_per_million")):
+                        if field in req:
+                            v = req[field]
+                            if v is not None:
+                                if isinstance(v, bool) or not isinstance(v, (int, float)):
+                                    raise ValueError(f"{field}: a number or null")
+                                if not math.isfinite(v):
+                                    raise ValueError(f"{field}: a finite number or null")
+                                if v < 0:
+                                    raise ValueError(f"{field}: a non-negative number or null")
+                            setattr(shown, attr, float(v) if v is not None else None)
+                            changed.append(field)
+                    if shown.totals_path:
+                        with shown.status_lock:
+                            shown._save_totals()
+                    from serve.totals import totals_with_cost
+                    with shown.status_lock:
+                        totals = {"since": int(shown.started_at), "requests": shown.requests_done, **shown.totals}
+                        totals_with_cost(totals, shown.cost_input_per_million, shown.cost_output_per_million,
+                                         shown.cost_cache_write_per_million, shown.cost_cache_hit_per_million)
+                    self._json(200, {"status": "ok", "changed": changed, "totals": totals})
+                    return
+                if path == "/api/totals-reset":
+                    if not self._own_page("totals can be reset"):
+                        return
+                    shown = router.shown()
+                    if not shown.totals_path:
+                        self._json(400, {"error": {"message": "no totals file configured"}})
+                        return
+                    from serve.totals import totals_reset_file
+                    prev = totals_reset_file(shown.totals_path)
+                    with shown.status_lock:
+                        shown.totals = {"prompt": 0, "reused": 0, "written": 0, "prompt_ms": 0.0, "decode_ms": 0.0}
+                        shown.requests_done = 0
+                        shown.started_at = time.time()
+                        shown._save_totals()
+                    self._json(200, {"status": "reset", "previous": str(prev) if prev else None})
                     return
                 if path == "/v1/answer_now":
                     rid = req.get("request_id")
@@ -523,6 +608,7 @@ def make_handler(target: Service | Router):
                     return
                 self.svc.request_ctx.path = path
                 self.svc.request_ctx.model = self.svc.model  # always the served name, never the requested one
+                self.svc.request_ctx.arrived = time.time()   # arrival timestamp for end-to-end / TTFT histograms
                 with document_sources(self._image_access()):   # a document by URL or path follows the image rules
                     if path == "/v1/responses":
                         self._responses(req)
@@ -682,7 +768,8 @@ def make_handler(target: Service | Router):
             self.end_headers()
 
         def _unknown_model(self, path, name):
-            """404 for a missing or unserved model, in the shape of the API called."""
+            """404 for a name that serves nothing, or no name where several models are configured, in the shape of the
+            API called. A request naming no model reaches here only through `Router.service_for`."""
             anthropic = path.startswith("/v1/messages")
             if name is None:
                 text = "model: required" if anthropic else "model is required"
@@ -962,7 +1049,20 @@ class Server(ThreadingHTTPServer):
 
     router: Router | None = None
 
+    def __init__(self, *args, **kwargs):
+        self.log_stop = threading.Event()
+        super().__init__(*args, **kwargs)
+
+    def shutdown(self):
+        self.log_stop.set()
+        if getattr(self, "ui_state", None) is not None:
+            self.ui_state.close()
+        super().shutdown()
+
     def server_close(self):
+        self.log_stop.set()
+        if getattr(self, "ui_state", None) is not None:
+            self.ui_state.close()
         super().server_close()
         if self.router is not None:
             self.router.stop_telemetry()           # serve() started the sampler, so closing the server ends it
@@ -979,5 +1079,6 @@ def serve(target: Service | Router, host="127.0.0.1", port=8080) -> ThreadingHTT
     router.start_telemetry()
     httpd = Server((host, port), make_handler(router))
     httpd.router = router
+    httpd.ui_state = UIState(router)
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
     return httpd

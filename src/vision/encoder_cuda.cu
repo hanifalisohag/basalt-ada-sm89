@@ -1,4 +1,5 @@
 // src/vision/encoder_cuda.cu - see basalt/vision/encoder_cuda.hpp.
+#include "basalt/core/device_copy.hpp"
 #include "basalt/vision/encoder_cuda.hpp"
 
 #include <cublas_v2.h>
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <cstring>
 
+#include "basalt/vision/preprocess.hpp"
 #include "hy4_weights.hpp"
 #include "vision_kernels.cuh"
 
@@ -178,7 +180,12 @@ struct CudaEncoder::Impl {
         cls = m.find("v.class_embd") != nullptr;
         if (cls) {
             E = 1024; F = 4096; D = 64; DP = 64; patch = 20; PV = 3 * 20 * 20;
-            for (int c = 0; c < 3; ++c) { norm.mean[c] = h.mean[c] * 255.0f; norm.std[c] = h.std[c] * 255.0f; }
+            for (int c = 0; c < 3; ++c) {
+                norm.clip_mean[c] = vision::kClipMean[c];
+                norm.clip_std[c] = vision::kClipStd[c];
+                norm.mean[c] = h.mean[c];
+                norm.std[c] = h.std[c];
+            }
         }
         if (h.embd != E || h.heads != H || h.ffn != F || h.patch != patch || h.merge != 2 || h.layers < 1) {
             e = "unexpected projector hyper-parameters";
@@ -462,10 +469,10 @@ struct CudaEncoder::Impl {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
             std::vector<float> h(count);
-            if (!bf) CK(cudaMemcpy(h.data(), dev, count * 4, cudaMemcpyDeviceToHost));
+            if (!bf) CK(basalt::core::device_copy(h.data(), dev, count * 4, cudaMemcpyDeviceToHost));
             else {
                 std::vector<__nv_bfloat16> b(count);
-                CK(cudaMemcpy(b.data(), dev, count * 2, cudaMemcpyDeviceToHost));
+                CK(basalt::core::device_copy(b.data(), dev, count * 2, cudaMemcpyDeviceToHost));
                 for (size_t i = 0; i < count; ++i) h[i] = __bfloat162float(b[i]);
             }
             tap(name, h.data(), count);
@@ -526,7 +533,7 @@ struct CudaEncoder::Impl {
             if (!tap) return true;
             CK(cudaStreamSynchronize(stream));
             std::vector<float> hbuf(count);
-            CK(cudaMemcpy(hbuf.data(), dev, count * 4, cudaMemcpyDeviceToHost));
+            CK(basalt::core::device_copy(hbuf.data(), dev, count * 4, cudaMemcpyDeviceToHost));
             tap(name, hbuf.data(), count);
             return true;
         };
