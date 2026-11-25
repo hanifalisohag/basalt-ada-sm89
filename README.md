@@ -44,6 +44,8 @@ pip install -r requirements.txt
 hf download jesdga/Inkling-2-Mini-Basalt Inkling-2-Mini-NVFP4-DQ8.basalt --local-dir ".\models\Inkling-2-Mini-Basalt"
 
 hf download jesdga/Inkling-2-Mini-Basalt Inkling-2-Mini-NVFP4-MX8.basalt --local-dir ".\models\Inkling-2-Mini-Basalt"
+
+hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-QUASAR-NVFP4.basalt --local-dir ".\models\Qwen3.8-27B-Basalt"
 ```
 
 The pack is one file, `Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB). It needs about 16.2 GiB of VRAM on the card, so it fits an

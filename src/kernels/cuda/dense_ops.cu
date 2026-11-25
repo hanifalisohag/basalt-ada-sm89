@@ -378,6 +378,13 @@ constexpr int GP_HV = 48, GP_S = 8, GP_TT = 64, GP_LD = 2 * GP_HV + 8, GP_NF = 2
 #else
 #define GP_NO_CLUSTERS 0
 #endif
+// The host side of the same choice: the reduce kernel exists only when the split form is built (Ada, or a pre-sm_90
+// device pass).  __CUDA_ARCH__ is undefined in host code, so the device macro above cannot gate the host call.
+#if defined(BASALT_ADA)
+#define GP_HOST_NO_CLUSTERS 1
+#else
+#define GP_HOST_NO_CLUSTERS 0
+#endif
 template <class In>
 #if GP_NO_CLUSTERS
 __global__ void __launch_bounds__(128)
@@ -906,7 +913,9 @@ void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, cons
     if (gdn_gating_clusters()) {
         gdn_gating_proj_kernel<float><<<dim3(tiles, 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
             x, w_ab, dt, ssm_a, gate, beta, T, K);
-    } else {
+    }
+#if GP_HOST_NO_CLUSTERS
+    else {
         float* scratch = nullptr;
         const size_t bytes = (size_t) tiles * GP_S * (GP_TT * GP_LD) * sizeof(float);
         if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
@@ -916,6 +925,7 @@ void gdn_gating_proj(const float* x, const uint16_t* w_ab, const float* dt, cons
         cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
         cudaFree(scratch);
     }
+#endif
     check("gdn_gating_proj");
 }
 void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, const float* ssm_a, float* gate, float* beta,
@@ -929,7 +939,9 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
     if (gdn_gating_clusters()) {
         gdn_gating_proj_kernel<__nv_bfloat16><<<dim3(tiles, 1, GP_S), 128, 0, (cudaStream_t) stream>>>(
             reinterpret_cast<const __nv_bfloat16*>(x), w_ab, dt, ssm_a, gate, beta, T, K);
-    } else {
+    }
+#if GP_HOST_NO_CLUSTERS
+    else {
         float* scratch = nullptr;
         const size_t bytes = (size_t) tiles * GP_S * (GP_TT * GP_LD) * sizeof(float);
         if (cudaMalloc(&scratch, bytes) != cudaSuccess) { basalt::log::error("basalt", "gdn_gating_proj: scratch"); std::exit(1); }
@@ -939,6 +951,7 @@ void gdn_gating_proj(const uint16_t* x, const uint16_t* w_ab, const float* dt, c
         cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
         cudaFree(scratch);
     }
+#endif
     check("gdn_gating_proj");
 }
 
