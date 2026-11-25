@@ -10,13 +10,15 @@ on an NVIDIA Blackwell GPU (sm_120) on Linux and Windows x64, and on the DGX Spa
 
 ## This fork: Ada (sm_89) support
 
-This is a fork of Basalt that adds an **Ada (sm_89) build** so **Inkling 2 Mini** runs on an RTX 4090. Upstream Basalt is
-Blackwell (sm_120) only; this fork keeps that path unchanged and adds a second one. Only Inkling 2 Mini is wired for sm_89.
+This is a fork of Basalt that adds an **Ada (sm_89) build** so **Inkling 2 Mini** and **Qwen3.8-27B** run on an RTX 4090.
+Upstream Basalt is Blackwell (sm_120) only; this fork keeps that path unchanged and adds a second one. Those two models are
+wired for sm_89; the other three (`qwen4exp`, `deepseek41`, `hy4flash`) still need a Blackwell card.
 
 What differs from upstream:
 
 - The build takes `-DCMAKE_CUDA_ARCHITECTURES=89` and defines `BASALT_ADA`. The Blackwell-only prefill products (the FP4
-  block-scaled tensor-core path and the FP8 path) are left out; prefill runs through the portable MMQ path instead.
+  block-scaled tensor-core path and the FP8 path) are left out; prefill runs through the portable MMQ path instead, and the
+  dense W4A4 product (`prefill::fp4_dense`, which Qwen3.8-27B's forward is built on) gets an Ada kernel on `mma.m16n8k16.bf16`.
 - The sm_120a-only instructions get portable fallbacks: the FP4/FP8 to bf16 conversions are done in software, the
   `cp.async.bulk.prefetch.L2` hint compiles out, and the cluster attention, GDN and gating kernels fall back to their
   non-cluster split forms.
@@ -30,12 +32,18 @@ This fork is **not upstreamable**: [CONTRIBUTING.md](CONTRIBUTING.md#scope) stat
 Windows x64, from an x64 VS 2022 prompt, with CUDA 13 and Ninja:
 
 ```sh
-cmake -S . -B build_sm89 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS=inkling2 -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build_sm89 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS="qwen35;inkling2" -DCMAKE_BUILD_TYPE=Release
 cmake --build build_sm89 -j 8
 ```
 
-`-DBASALT_MODELS=inkling2` builds only Inkling 2 Mini. Drop it to build every model, but only Inkling 2 Mini runs on sm_89.
+`-DBASALT_MODELS` names the models to build; the two that run on sm_89 are **`qwen35`** (Qwen3.8-27B) and **`inkling2`**
+(Inkling 2 Mini). One binary serves both: the pack's `general.architecture` picks the model. Leave the flag out
+(`-DBASALT_MODELS=all`, the default) to compile every model Basalt ships — `qwen4exp`, `deepseek41`, `qwen35`, `hy4flash`
+and `inkling2` — but only `qwen35` and `inkling2` have an sm_89 path, so the other three load only on a Blackwell card.
 The binaries land in `bin/` (`basalt`, `basalt-bench`, `basalt-probe`, `basalt-vision`).
+
+A pack whose model the build left out is refused at load with the architecture name and the flag to rebuild with, so a
+`qwen35;inkling2` build is enough for both packs below.
 
 ### Get the pack
 
@@ -55,6 +63,11 @@ RTX 4090 (24 GB) with room for the context.
 Blackwell that goes through the block-scaled tensor-core kernel; on Ada the same weights go through the portable MMQ
 path, which now has an MXFP8 tile: the E4M3 codes are quantized to int8 per 32-value sub-block and the UE8M0 scale is
 folded into the float the epilogue multiplies by. The MX8 pack loads and generates on an RTX 4090.
+
+**The Qwen3.8-27B pack runs on sm_89 too.** `Qwen3.8-27B-QUASAR-NVFP4.basalt` (21.1 GB) is a dense model whose forward is
+built on the dense W4A4 product. On Blackwell that is the TMA block-scaled kernel; on Ada it is `fp4_dense_ada.cu`, the same
+API on `mma.m16n8k16.bf16`, decoding the NVFP4 planes and the quantized activation to bf16 in registers. It loads 18.4 GiB
+(16.0 GiB on the card, 2.4 GiB of embedding in RAM) and generates on an RTX 4090.
 
 ### Run
 
@@ -98,6 +111,32 @@ use the long-context configs when it does not.
 bin/basalt serve --config basalt_config_dq8_fullgpu.json --python .venv/Scripts/python.exe
 bin/basalt serve --config basalt_config_mx8_fullgpu.json --python .venv/Scripts/python.exe
 ```
+
+### Qwen3.8-27B
+
+The repo ships two configs for the Qwen3.8-27B pack. It is a **dense** model, so there are no experts to spill: the whole
+16.0 GiB of weights sits on the card and the context takes what is left, with the 2.4 GiB BF16 embedding in page-locked RAM.
+
+`basalt_config_qwen_fullgpu.json` keeps **every weight on the card** and the KV cache in VRAM: a **106,496-token** context
+with `kv int8` (33 KiB per position), which is the largest that fits beside the weights on a 24 GB card. Decode runs at
+roughly 45 tok/s with drafting on (measured on an RTX 4090, a 325-token reply).
+
+```sh
+bin/basalt serve --config basalt_config_qwen_fullgpu.json --python .venv/Scripts/python.exe
+```
+
+`basalt_config_qwen.json` instead reaches the model's **full 262,144-token** context by streaming the KV cache to
+page-locked RAM (`kv-resident 32768` keeps the first 32K positions of each attention layer on the card). Attention reads
+every position for every token, so each decoded token reads the positions past 32K over the bus and decode slows with the
+context; the output is bitwise the same as with every position on the card. Use it when the context matters more than speed.
+
+```sh
+bin/basalt serve --config basalt_config_qwen.json --python .venv/Scripts/python.exe
+```
+
+Both set `vram-reserve-mib 256` (the default 700 leaves too little for the cache) and `ram-reserve-mib 1024`. The ceiling
+moves with the free VRAM at start: close other programs to raise it, or lower `max-context` to leave headroom. The model's
+own guide, with its architecture, memory and quality notes, is [Qwen3.8-27B](docs/models/qwen38-27b.md).
 
 Model paths in the file are relative to the file itself. The server listens on 127.0.0.1:8080 and speaks the OpenAI and
 Anthropic APIs. The `--python` flag points at a Python with `requirements.txt` installed (a venv is fine); the server uses it
@@ -145,7 +184,7 @@ its numbers there are for an RTX 5090 and do not apply to sm_89.
 ### Tests
 
 ```sh
-cmake -S . -B build_sm89 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS=inkling2 -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+cmake -S . -B build_sm89 -G Ninja -DCMAKE_CUDA_ARCHITECTURES=89 -DBASALT_MODELS="qwen35;inkling2" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build build_sm89 -j 8
 ctest --test-dir build_sm89 --output-on-failure
 ```

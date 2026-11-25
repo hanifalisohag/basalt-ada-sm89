@@ -1,0 +1,21 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "model": "models/Qwen3.8-27B-Basalt/Qwen3.8-27B-QUASAR-NVFP4.basalt",
+      "gpu": "0",
+      "max-context": 106496,
+      "kv": "int8",
+      "vision": "dynamic"
+    }
+  ],
+  "engine": {
+    "vram-reserve-mib": 256,
+    "ram-reserve-mib": 1024,
+    "fit-max-tokens": true
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  }
+}
