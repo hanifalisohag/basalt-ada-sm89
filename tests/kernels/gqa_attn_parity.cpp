@@ -527,7 +527,13 @@ int main(int argc, char** argv) {
             basalt::kernels::gqa_decode_attn_segs(dq, NH, NKV, sg, 2, dscr, cap, dout, nullptr);
             fold(hash[3], (size_t) 12 * NH * HD);
         }
+        // The decode kernel's exact output bits: the compiler's instruction selection differs by architecture, so each
+        // build pins its own golden values (the accuracy checks above are the architecture-independent ones).
+#if defined(BASALT_ADA)
+        const unsigned long long frozen[4] = {0xe623cf95c7cf1db6ull, 0x4ef92fd5e661f377ull, 0x975a047781ba58c2ull, 0x2c965200ddb0e159ull};
+#else
         const unsigned long long frozen[4] = {0x430a8888287f57faull, 0xb6471ecdf9c79b73ull, 0x1c64ae81d108b6b5ull, 0x24e2ead0c780fabeull};
+#endif
         std::printf("decode hashes: %016llx %016llx %016llx %016llx\n", hash[0], hash[1], hash[2], hash[3]);
         bool frozen_ok = true;
         for (int i = 0; i < 4; ++i) frozen_ok = frozen_ok && hash[i] == frozen[i];

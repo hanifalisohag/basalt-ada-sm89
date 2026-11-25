@@ -48,6 +48,7 @@ __device__ __forceinline__ void ldmatrix_x4(unsigned& r0, unsigned& r1, unsigned
 }
 
 // c += A (16 tokens x 64 values, E2M1 with a UE4M3 scale per 16) * B (64 x 8 weight rows, same format)
+#if !defined(BASALT_ADA)
 __device__ __forceinline__ void mma_fp4(float* c, const unsigned* a, unsigned b0, unsigned b1, unsigned sfa,
                                         unsigned sfb) {
     constexpr unsigned short kId = 0;
@@ -831,6 +832,8 @@ __global__ void tails_kernel(GemmArgs a, size_t off, int n, float* dst) {
     if (j < n) ((float4*) dst)[j] = *(const float4*) (a.blob[j] + off);
 }
 
+#endif  // !BASALT_ADA
+
 }  // namespace
 
 size_t a4_bytes(int64_t rows, int64_t cols, int experts) {
@@ -840,6 +843,9 @@ size_t scale_count(int64_t rows, int experts) {
     return (size_t) ((rows + kTileTokens - 1) / kTileTokens + experts) * kTileTokens;
 }
 
+size_t token_bytes(int64_t tokens, int64_t cols) { return (size_t) tokens * (size_t) (cols / 2 + cols / 16); }
+
+#if !defined(BASALT_ADA)
 void plan(const int32_t* bounds, int n, int32_t* tile_off, void* stream) {
     plan_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(bounds, n, tile_off);
     ck(cudaGetLastError(), "plan");
@@ -881,8 +887,6 @@ void quantize_f16(const uint16_t* x, const int32_t* bounds, const int32_t* tile_
     else { basalt::log::error("basalt", "prefill fp4: %lld fp16 columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize_f16");
 }
-
-size_t token_bytes(int64_t tokens, int64_t cols) { return (size_t) tokens * (size_t) (cols / 2 + cols / 16); }
 
 void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, void* a4, float* gs, void* stream,
                      bool two) {
@@ -1046,5 +1050,7 @@ void cut_pieces(const int32_t* bounds, int n, int64_t cap, Pieces& out) {
     }
     out.group.push_back(np);
 }
+
+#endif  // !BASALT_ADA
 
 }  // namespace basalt::prefill::fp4

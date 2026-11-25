@@ -20,6 +20,7 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 #include "basalt/log.hpp"
 
@@ -456,10 +457,11 @@ __global__ void __cluster_dims__(4, 1, 1) __launch_bounds__(S) rec_seg_kernel(co
     cg::cluster_group cl = cg::this_cluster();
     rec_block<MAXT, NJ, false>(seg_args(a0, r, state_off, dst, off_c, off_hv), r.n, blockIdx.x / 4, blockIdx.x % 4, sm, &cl);
 }
+#endif  // !DM_REC_NO_CLUSTERS
 
 // rec_split_kernel over a segmented window (rec_seg_kernel's rows), without clusters (a cluster launch keeps at most two
 // blocks on an SM whatever its size, too few for two segments' heads in one wave), the gates from dec_gdn_gates (every
-// block of a head computing them would read each row's activations four times)
+// block of a head computing them would read each row's activations four times).  Portable: compiled on every arch.
 template<int MAXT, int NJ>
 __global__ void __launch_bounds__(S) rec_split_seg_kernel(const DecRecArgs a0, const SegRow* rows, size_t state_off,
                                                           const SegDst* dst, size_t off_c, size_t off_hv, const float* gates,
@@ -472,7 +474,7 @@ __global__ void __launch_bounds__(S) rec_split_seg_kernel(const DecRecArgs a0, c
     rec_block<MAXT, NJ, true, false, true>(a, r.n, blockIdx.x / 4, blockIdx.x % 4, sm, nullptr, ga, ga + (size_t) n_tok * a.h_v);
 }
 
-// alpha and beta of every (row, value head) of a window, ab_pair's sums: a block a head, a warp a row
+// alpha and beta of every (row, value head) of a window, ab_pair's sums: a block a head, a warp a row.  Portable.
 template<int NJ>
 __global__ void __launch_bounds__(128) gates_kernel(const DecRecArgs a, int n_tok, float* gates) {
     __shared__ uint4 wab[2][32 * NJ];
@@ -489,7 +491,6 @@ __global__ void __launch_bounds__(128) gates_kernel(const DecRecArgs a, int n_to
     ab_pair<NJ>(a, wab, t, lane, dt, sa, al, be);
     if (lane == 0) { gates[(size_t) t * a.h_v + gh] = al; gates[((size_t) n_tok + t) * a.h_v + gh] = be; }
 }
-#endif  // !DM_REC_NO_CLUSTERS
 
 // one warp per (token, value head): the head's four 32-value sums of squares in rank order, then norm_q8 per rank
 __global__ void __launch_bounds__(128) rec_norm_kernel(const DecRecArgs a, int T) {
@@ -534,10 +535,30 @@ static void by_width(int n_embd, int max_t, L launch) {
         else launch(K<16, 10>::f);
     }
 }
+#if !defined(BASALT_ADA)
 template<int MAXT, int NJ> struct RecK { static constexpr auto f = rec_kernel<MAXT, NJ>; };
+#endif
 template<int MAXT, int NJ> struct SplitK { static constexpr auto f = rec_split_kernel<MAXT, NJ>; };
+#if !defined(BASALT_ADA)
 template<int MAXT, int NJ> struct SegK { static constexpr auto f = rec_seg_kernel<MAXT, NJ>; };
+#endif
 template<int MAXT, int NJ> struct SplitSegK { static constexpr auto f = rec_split_seg_kernel<MAXT, NJ>; };
+
+// The cluster kernels (rec_kernel, rec_seg_kernel) are Hopper (sm_90) and later.  On Ada (sm_89) the split variants
+// run instead: they compute the same values without clusters, with the gates from dec_gdn_gates.
+static bool rec_clusters() {
+#if defined(BASALT_ADA)
+    return false;
+#else
+    static const bool ok = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    return ok;
+#endif
+}
 
 void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     if (n_tok < 1 || n_tok > kDecMaxT || !dec_gdn_rec_supported(a.n_embd) || a.h_k <= 0 || a.h_v % a.h_k != 0 ||
@@ -547,7 +568,25 @@ void dec_gdn_rec(const DecRecArgs& a, int n_tok, void* stream) {
     }
     const dim3 grid((unsigned) (mapped_heads(a) * 4)), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    by_width<RecK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, n_tok); });
+    if (rec_clusters()) {
+#if !defined(BASALT_ADA)
+        by_width<RecK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, n_tok); });
+#endif
+    } else {
+        // the split kernel writes the head's raw output to a.o (the cluster kernel keeps it in shared memory); when the
+        // caller left a.o unset, a.y serves as the raw buffer (the norm reads each value before writing it)
+        DecRecArgs b = a;
+        float* raw = a.o ? a.o : a.y;
+        const bool owned = !raw;
+        if (owned) cudaMalloc(&raw, (size_t) n_tok * a.h_v * S * sizeof(float));
+        b.o = raw;
+        by_width<SplitK>(a.n_embd, n_tok, [&](auto k) { launch_pdl(k, grid, block, 0, s, b, n_tok); });
+        const cudaError_t e0 = cudaGetLastError();
+        if (e0 != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e0)); std::exit(1); }
+        dec_gdn_rec_norm(b, n_tok, stream);
+        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
+        if (owned) cudaFree(raw);
+    }
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec: %s", cudaGetErrorString(e)); std::exit(1); }
 }
@@ -561,7 +600,57 @@ void dec_gdn_rec_seg(const DecRecArgs& a, const SegRow* rows, size_t state_off, 
     }
     const dim3 grid((unsigned) (a.h_v * 4), (unsigned) n_rows), block(S);
     const cudaStream_t s = (cudaStream_t) stream;
-    by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off, dst, off_c, off_hv); });
+#if defined(BASALT_ADA)
+    {
+        // no clusters: the tested two-launch form (dec_gdn_gates, then dec_gdn_rec_seg_split, which runs the norm).
+        // dec_gdn_gates writes alpha [n_tok][h_v] then beta, and the split kernel indexes them by the segment's first
+        // row (r.row0), so n_tok is the window's total row count.
+        int n_tok = 0;
+        {
+            std::vector<SegRow> hrows((size_t) n_rows);
+            cudaMemcpy(hrows.data(), rows, (size_t) n_rows * sizeof(SegRow), cudaMemcpyDeviceToHost);
+            for (int k = 0; k < n_rows; ++k) n_tok += hrows[k].n;
+        }
+        float* gates = nullptr;
+        cudaMalloc(&gates, (size_t) 2 * n_tok * a.h_v * sizeof(float));
+        dec_gdn_gates(a, n_tok, gates, stream);
+        // the split kernel writes the head's raw output to a.o (the cluster kernel keeps it in shared memory); when the
+        // caller left a.o unset, a.y serves as the raw buffer (the norm reads each value before writing it)
+        DecRecArgs b = a;
+        float* raw = a.o ? a.o : a.y;
+        const bool owned = !raw;
+        if (owned) cudaMalloc(&raw, (size_t) n_tok * a.h_v * S * sizeof(float));
+        b.o = raw;
+        dec_gdn_rec_seg_split(b, rows, state_off, n_rows, max_n, n_tok, stream, dst, off_c, off_hv, gates);
+        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
+        if (owned) cudaFree(raw);
+        cudaFree(gates);
+    }
+#else
+    if (rec_clusters()) {
+        by_width<SegK>(a.n_embd, max_n, [&](auto k) { launch_pdl(k, grid, block, 0, s, a, rows, state_off, dst, off_c, off_hv); });
+    } else {
+        // no clusters: the tested two-launch form (dec_gdn_gates, then dec_gdn_rec_seg_split, which runs the norm)
+        int n_tok = 0;
+        {
+            std::vector<SegRow> hrows((size_t) n_rows);
+            cudaMemcpy(hrows.data(), rows, (size_t) n_rows * sizeof(SegRow), cudaMemcpyDeviceToHost);
+            for (int k = 0; k < n_rows; ++k) n_tok += hrows[k].n;
+        }
+        float* gates = nullptr;
+        cudaMalloc(&gates, (size_t) 2 * n_tok * a.h_v * sizeof(float));
+        dec_gdn_gates(a, n_tok, gates, stream);
+        DecRecArgs b = a;
+        float* raw = a.o ? a.o : a.y;
+        const bool owned = !raw;
+        if (owned) cudaMalloc(&raw, (size_t) n_tok * a.h_v * S * sizeof(float));
+        b.o = raw;
+        dec_gdn_rec_seg_split(b, rows, state_off, n_rows, max_n, n_tok, stream, dst, off_c, off_hv, gates);
+        cudaStreamSynchronize((cudaStream_t) stream);   // the kernels are async: free only after they finish
+        if (owned) cudaFree(raw);
+        cudaFree(gates);
+    }
+#endif
     const cudaError_t e = cudaGetLastError();
     if (e != cudaSuccess) { basalt::log::error("basalt", "dec_gdn_rec_seg: %s", cudaGetErrorString(e)); std::exit(1); }
 }

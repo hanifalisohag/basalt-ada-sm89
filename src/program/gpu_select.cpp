@@ -136,7 +136,15 @@ bool parse_gpu_spec(const std::string& text, GpuSpec& out, std::string& err) {
 // The main GPU runs the model's decode kernels (NVFP4 tensor cores, Blackwell instructions) — sm_120 only.
 // A peer GPU runs only the expert tier's standard CUDA kernels (Q8_1/Q2_0 rows, shared-memory rings,
 // doorbells), which a build with -DPEER_ADA=ON also compiles for sm_89 (Ada).
-bool gpu_main_supported(const GpuCard& c) { return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0); }
+// A BASALT_ADA build compiles the decode kernels for sm_89 too (the FP4 tensor-core prefill is replaced by the
+// portable MMQ path), so sm_89 is a supported main card there.
+bool gpu_main_supported(const GpuCard& c) {
+#if defined(BASALT_ADA)
+    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0) || (c.cc_major == 8 && c.cc_minor == 9);
+#else
+    return c.cc_major == 0 || (c.cc_major == 12 && c.cc_minor == 0);
+#endif
+}
 // sm_89 (Ada) is the one older architecture the peer kernels can be compiled for (when built with PEER_ADA);
 // a peer card of any other pre-Blackwell arch (or an sm_89 card without PEER_ADA) is rejected here
 // rather than failing later with 'no kernel image' at the first peer launch.
@@ -231,7 +239,11 @@ GpuChoice choose_gpus(const GpuSpec& spec, const std::vector<GpuCard>& visible, 
             c.cards.clear();
             return c;
         }
-        if (known && idx > 0 && !gpu_peer_supported(visible[(size_t) i])) {
+        if (known && idx > 0 && !gpu_peer_supported(visible[(size_t) i])
+#if defined(BASALT_ADA)
+            && !gpu_main_supported(visible[(size_t) i])   // the Ada build runs a second sm_89 card as main too
+#endif
+        ) {
 #if !defined(BASALT_PEER_ADA)
             if (visible[(size_t) i].cc_major == 8 && visible[(size_t) i].cc_minor == 9) {
                 c.error = "gpu: " + gpu_label(visible, i) + " is sm_89 (rebuild with -DPEER_ADA=ON to enable sm_89 peer support)";

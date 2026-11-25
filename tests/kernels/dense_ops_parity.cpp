@@ -166,8 +166,9 @@ int main() {
             report("  gdn_gating_proj g", gg, wg, 3e-4);
             report("  gdn_gating_proj beta", bb, wb, 3e-5);
             std::printf("T = %d  old bf16_rows_dot + gdn_gates:\n", Tc);
-            report("  old g", gg0, wg, 3e-4);
-            report("  old beta", bb0, wb, 3e-5);
+            // the old two-kernel reference rounds through bf16 twice, so its own error is larger than the fused kernel's
+            report("  old g", gg0, wg, 1e-3);
+            report("  old beta", bb0, wb, 1e-4);
             if (Tc == 2048) {   // microbench
                 cudaEvent_t e0, e1;
                 cudaEventCreate(&e0); cudaEventCreate(&e1);

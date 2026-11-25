@@ -43,7 +43,11 @@ __global__ void e2m1(unsigned* got, unsigned* alt) {
     bk::e2m1x8_bf16x2_via_f16(e2m1_word(i), t);
     for (int k = 0; k < 4; ++k) {
         unsigned d;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+        d = bk::bf16x2_mul(t[k], bk::e4m3x2_bf16x2_via_f16(s | (s << 8)));
+#else
         asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(d) : "r"(t[k]), "r"(bk::e4m3x2_bf16x2_via_f16(s | (s << 8))));
+#endif
         got[4 * i + k] = h[k];
         alt[4 * i + k] = d;
     }

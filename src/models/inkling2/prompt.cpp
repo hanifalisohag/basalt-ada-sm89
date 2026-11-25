@@ -476,8 +476,23 @@ private:
     // as two FP4 terms (its rounding and the rounding of the rest, E4M3 scales per 16 under one token scale, about 8 bits;
     // one FP4 term costs KLD 0.0025 -> 0.0041), both through each weight fragment on one fp32 chain. Gate/up from the token
     // planes into H as the softcapped SwiGLU, H rounded per expert tile, then down into the pairs' rows.
-    bool fp4_shape() const { return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024; }
+    // The FP4 block-scaled tensor cores are sm_120a: on Ada (sm_89) the MMQ path below runs instead, which is the
+    // same arithmetic the FP4 path's fallback uses (the FP4 planes are only a prefill speedup, not a different result).
+    bool fp4_shape() const {
+#if defined(BASALT_ADA)
+        return false;
+#else
+        return g_.n_embd == 2304 && g_.n_ff_exp == 1152 && g_.n_expert <= 1024;
+#endif
+    }
     void experts_fp4(const LayerWeights& w, int rows) {
+#if defined(BASALT_ADA)
+        // fp4_shape() is false on Ada, so this is unreachable; the body is compiled out because the FP4 kernels are
+        // sm_120a only.
+        (void) w;
+        (void) rows;
+        std::abort();
+#else
         const int E = g_.n_embd, F = g_.n_ff_exp, n = g_.n_expert, pairs = rows * g_.n_used;
         const bk::NativeExpertLayout L = bk::native_expert_layout(w.gu_type, w.d_type, E, F);
         fp4::plan_blocks(b_.bounds, n, b_.tile_off, b_.blk_off, stream_);
@@ -522,6 +537,7 @@ private:
         d.ld_dst = E;
         fp4::run(d, stream_);
         moe_combine_f16(gu16, b_.rw, rows, g_.n_used, b_.moe, stream_);
+#endif
     }
 
     InklingModel& m_;

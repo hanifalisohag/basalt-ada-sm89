@@ -324,6 +324,14 @@ struct FusedSmem {
 };
 
 template <bool FP8, int ROWS>
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 900
+__global__ void __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
+    // Thread-block clusters are Hopper (sm_90) and later.  On Ada (sm_89) attention_window() never launches this
+    // kernel: it takes the split/combine path instead.  The body is compiled out so the translation unit builds.
+    (void) pa;
+    (void) a;
+}
+#else
 __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps * 32) attn_fused_kernel(AttnPrep pa, AttnArgs a) {
     namespace cg = cooperative_groups;
     extern __shared__ __align__(16) unsigned char smem_raw[];
@@ -566,6 +574,7 @@ __global__ void __cluster_dims__(1, 1, kClusterSplits) __launch_bounds__(kWarps 
     // are complete, their values are in the stores above
     asm volatile("barrier.cluster.arrive.relaxed.aligned;\n\tbarrier.cluster.wait.aligned;" ::: "memory");
 }
+#endif
 
 int launch_splits(int64_t max_keys) {
     return (int) std::min<int64_t>(kMaxSplits, std::max<int64_t>(1, (max_keys + kUnit - 1) / kUnit));
@@ -600,7 +609,15 @@ void attention_decode(const AttnArgs& a, int rows, int64_t max_keys, void* scrat
 
 void attention_window(const AttnPrep& pa, const AttnArgs& a, int rows, int64_t max_keys, void* scratch, void* stream) {
     if (rows <= 0) return;
-    if (rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
+    // The fused kernel is a cluster kernel: Hopper (sm_90) and later only.  On Ada (sm_89) the split/combine path
+    // runs instead, which is the same fallback the conditions below already take.
+    static const bool clusters = [] {
+        int dev = 0, major = 0;
+        cudaGetDevice(&dev);
+        cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, dev);
+        return major >= 9;
+    }();
+    if (!clusters || rows > kFusedRows || launch_splits(max_keys) > kClusterSplits || a.q8 == nullptr || a.seg.at.n > 0) {
         decode_prepare(pa, rows, stream);
         attention_decode(a, rows, max_keys, scratch, nullptr, stream);
         return;

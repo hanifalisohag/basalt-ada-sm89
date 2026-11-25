@@ -235,11 +235,19 @@ DeviceInfo device_info(int ordinal) {
 
     // The binary holds code for one compute capability only; a card of another compute capability is refused here rather than failing
     // at its first kernel launch.
+#if defined(BASALT_ADA)
+    if (d.cc_major != 8 || d.cc_minor != 9) {
+        throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
+                            std::to_string(d.cc_minor) + "; this basalt build needs an NVIDIA GPU of compute capability 8.9",
+                        -1);
+    }
+#else
     if (d.cc_major != 12 || d.cc_minor != 0) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) + "." +
                             std::to_string(d.cc_minor) + "; basalt needs an NVIDIA GPU of compute capability 12.0",
                         -1);
     }
+#endif
     return d;
 }
 

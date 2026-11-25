@@ -510,7 +510,7 @@ __global__ void __launch_bounds__(512) head_final_kernel(DsHead h, const Q81* __
     __syncthreads();
     px::pick_block<false>(f, n, n_tiles, nullptr, part, prev, conf + i);
     __syncthreads();
-    const int pick = *prev;
+    const int pick = *(volatile const int32_t*) prev;   // pick_block wrote it from thread 0; read it back after the sync
     if (tid == 0) ids[i] = pick;
     for (int c = warp; c < n; c += 16)
         if (f.list[c] == pick) reinterpret_cast<uint4*>(w1_row)[lane] = wr[c][lane];
