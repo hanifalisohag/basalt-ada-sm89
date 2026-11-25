@@ -346,7 +346,7 @@ int parity(cudaStream_t s, const Gate& gate) {
     std::vector<float> h_dev((size_t) rows * FF);
     {
         Dev gu_d((size_t) rows * 2 * FF * 4), h_d((size_t) rows * FF * 4);
-        ck(cudaMemcpy(gu_d.p, ygu.data(), (size_t) rows * 2 * FF * 4, cudaMemcpyHostToDevice), "gu up");
+        ck(cudaMemcpyAsync(gu_d.p, ygu.data(), (size_t) rows * 2 * FF * 4, cudaMemcpyHostToDevice, s), "gu up");
         const int64_t n = rows * FF;
         swiglu_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s>>>(gu_d.as<float>(), h_d.as<float>(), n);
         ck(cudaStreamSynchronize(s), "swiglu");
