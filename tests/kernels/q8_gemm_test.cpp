@@ -519,8 +519,8 @@ void run_bench(std::mt19937& rng) {
 
 int main(int argc, char** argv) {
     cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major < 12) {
-        std::printf("SKIP: requires Blackwell (sm_120+)\n");
+    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess || prop.major < 8) {
+        std::printf("SKIP: requires sm_80+\n");
         return 77;
     }
     std::printf("GPU: %s (sm_%d%d, %d SMs)\n", prop.name, prop.major, prop.minor, prop.multiProcessorCount);

@@ -3,6 +3,11 @@
 // - Large shapes (>= 12 waves at 128x128): 16-warp unified 128x128 double-buffered TMA kernel (70 KiB SMEM, 128 regs, 0 spills).
 // - Smaller / narrower shapes: 2-CTA/SM warp-specialized 64x64 TMA kernel (35 KiB SMEM, ldmatrix.x4 A & B, 0 spills).
 // - Quantizer: vectorized 128-element warp quantizer (4 blocks of 32 floats per warp via float4/char4).
+//
+// On Ada (sm_89) there is no TMA and no mbarrier, so the two GEMM kernels stage their tiles with cp.async instead:
+// the same 128-byte XOR swizzle, the same ldmatrix fragments and the same mma.m16n8k32.s8.s8.s32 loop, with a
+// cp.async.commit_group / wait_group pipeline in place of the mbarrier phases. The quantizer and the scale
+// transposes are unchanged (they never used TMA).
 #include "basalt/prefill/q8_gemm.hpp"
 
 #include <cuda.h>
@@ -54,6 +59,13 @@ struct Args {
     Seg seg[MAX_SEG];
     const float* a_scale;
     int nseg, ntok, tok_tiles, total_tiles, k_tiles, k_blocks, a_sc_ld, epi;
+#if defined(BASALT_ADA)
+    // Ada has no TMA, so the kernels read the raw int8 codes directly: the activation plane and one weight plane per
+    // segment. The row stride of both is `k_blocks * 32` (= w_cols, a multiple of 64).
+    const int8_t* act_codes;
+    const int8_t* w_codes[MAX_SEG];
+    int w_cols;
+#endif
 };
 
 __device__ __forceinline__ unsigned su(const void* p) { return (unsigned) __cvta_generic_to_shared(p); }
@@ -72,6 +84,17 @@ __device__ __forceinline__ void mma_s8(int& c0, int& c1, int& c2, int& c3, unsig
         : "=r"(c0), "=r"(c1), "=r"(c2), "=r"(c3)
         : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(z), "r"(z), "r"(z), "r"(z));
 }
+__device__ __forceinline__ void cp16(void* dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
+}
+__device__ __forceinline__ void cp_commit() { asm volatile("cp.async.commit_group;" ::: "memory"); }
+template <int N>
+__device__ __forceinline__ void cp_wait() {
+    asm volatile("cp.async.wait_group %0;" ::"n"(N) : "memory");
+}
+__device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
+
+#if !defined(BASALT_ADA)
 __device__ __forceinline__ void mb_init(unsigned long long* b, unsigned n) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;" ::"r"(su(b)), "r"(n) : "memory");
 }
@@ -88,15 +111,13 @@ __device__ __forceinline__ void mb_expect(unsigned long long* b, unsigned bytes)
 __device__ __forceinline__ void cp_mb_arrive(unsigned long long* b) {
     asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];" ::"r"(su(b)) : "memory");
 }
-__device__ __forceinline__ void cp16(void* dst, const void* src) {
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 16;" ::"r"(su(dst)), "l"(src) : "memory");
-}
 __device__ __forceinline__ void tma2d(void* dst, const TmaDesc* m, int k, int r, unsigned long long* b) {
     asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2, %3}], [%4];"
                  ::"r"(su(dst)), "l"(m), "r"(k), "r"(r), "r"(su(b)) : "memory");
 }
-__device__ __forceinline__ int sw(int row, int byte) { return row * BK + (byte ^ ((row & 7) << 4)); }
+#endif  // !BASALT_ADA
 
+#if !defined(BASALT_ADA)
 __global__ __launch_bounds__(160, 2)
 void gemm_64x64_ws_kernel(const __grid_constant__ Args p) {
     constexpr int BT = 64, BR = 64, WT = 2, WR = 2;
@@ -409,6 +430,181 @@ void gemm_128x128_u16_kernel(const __grid_constant__ Args p) {
         }
     }
 }
+#endif  // !BASALT_ADA
+
+#if defined(BASALT_ADA)
+// Ada (sm_89): no TMA, no mbarrier. The tiles are staged with cp.async into the same 128-byte XOR swizzle the
+// ldmatrix fragments expect, and the pipeline is cp.async.commit_group / wait_group with one __syncthreads per
+// stage. The MMA loop, the scale application and the epilogue are identical to the Blackwell kernels above.
+__global__ __launch_bounds__(160, 2)
+void gemm_64x64_ws_kernel(const __grid_constant__ Args p) {
+    constexpr int BT = 64, BR = 64, WT = 2, WR = 2;
+    constexpr int WTOK = 32, WROW = 32, MT = 2, MR = 4;
+    constexpr int ACT_B = ST * BT * BK, W_B = ST * BR * BK;
+
+    extern __shared__ __align__(1024) unsigned char raw[];
+    unsigned char* act = raw;
+    unsigned char* wt = raw + ACT_B;
+    float* asc = reinterpret_cast<float*>(wt + W_B);
+    __half* wsc = reinterpret_cast<__half*>(asc + ST * 4 * BT);
+
+    constexpr int G = 8;
+    const int gsz = G * p.tok_tiles;
+    const int grp = (int) blockIdx.x / gsz;
+    const int rem = (int) blockIdx.x - grp * gsz;
+    const int rg = (grp + 1) * G <= p.total_tiles ? G : (p.total_tiles - grp * G);
+    const int rt = grp * G + rem % rg;
+    const int tt = rem / rg;
+    int si = 0;
+    for (int i = 1; i < p.nseg; ++i) if (rt >= p.seg[i].tile0) si = i;
+    const Seg& seg = p.seg[si];
+    const int row0 = (rt - seg.tile0) * BR;
+    const int tok0 = tt * BT;
+    const int full_kt = p.k_blocks >> 2;
+
+    const int tid = (int) threadIdx.x;
+    // The 64x64 tile needs a 2x2 warp grid, so only the first 128 threads run the MMA and the epilogue; all 160
+    // stage the tiles (the sm_120 kernel instead gives the first warp to the TMA producer).
+    const bool consumer = tid < 128;
+    const int lane = tid & 31, warp = tid >> 5;
+    const int wtk = warp / WR, wrw = warp % WR;
+    const int am = lane >> 3;
+    const int a_row = (lane & 7) + ((am & 1) << 3);
+    const int a_col = (am >> 1) * 16;
+    const int b_row = lane & 7;
+    const int b_col = ((lane >> 3) & 1) * 16;
+    const int g = lane >> 2, c2 = 2 * (lane & 3);
+    const int t_off = wtk * WTOK + g, r_off = wrw * WROW + c2;
+
+    // The K tail (w_cols not a multiple of BK) and the rows past ntok / seg.rows are not staged, so the MMA would
+    // read whatever the buffer held. Zero the whole tile region once: the sm_120 TMA path zero-fills the same slots.
+    for (int i = tid; i < ACT_B + W_B + ST * 4 * BT * (int) sizeof(float) + ST * 4 * BR * (int) sizeof(__half); i += 160)
+        raw[i] = 0;
+    __syncthreads();
+
+    // Stage one K tile: the BT x BK activation tile and the BR x BK weight tile, both in the swizzled layout, plus
+    // the four activation scale rows and four weight scale rows the MMA loop reads. 160 threads: 128 cover the two
+    // code tiles (16-byte chunks), 32 cover the scales.
+    const auto stage = [&](int kt) {
+        const int st = kt & 1;
+        unsigned char* as = act + st * BT * BK;
+        unsigned char* ws = wt + st * BR * BK;
+        const int kb = kt * 4;
+        // Activation tile: BT rows x BK bytes = BT * 8 chunks of 16 bytes. Rows past ntok and 16-byte chunks past
+        // w_cols are left as they are: the epilogue drops those tokens and the MMA's K tail is masked by the scale
+        // plane (the sm_120 TMA path zero-fills both the same way).
+        for (int item = tid; item < BT * (BK / 16); item += 160) {
+            const int r = item / (BK / 16), c = item - r * (BK / 16);
+            if (tok0 + r >= p.ntok || kt * BK + c * 16 >= p.w_cols) continue;
+            const int64_t src = (int64_t) (tok0 + r) * p.k_blocks * 32 + (int64_t) kt * BK + c * 16;
+            cp16(as + sw(r, c * 16), p.act_codes + src);
+        }
+        // Weight tile: BR rows x BK bytes. Rows past the segment's rows and chunks past w_cols are left as they are.
+        for (int item = tid; item < BR * (BK / 16); item += 160) {
+            const int r = item / (BK / 16), c = item - r * (BK / 16);
+            if (row0 + r >= seg.rows || kt * BK + c * 16 >= p.w_cols) continue;
+            const int64_t src = (int64_t) (row0 + r) * p.k_blocks * 32 + (int64_t) kt * BK + c * 16;
+            cp16(ws + sw(r, c * 16), p.w_codes[si] + src);
+        }
+        // Scales: 4 activation rows (BT wide) and 4 weight rows (BR wide), 16 bytes each.
+        if (tid < 32) {
+            const int ks_a0 = tid >> 4, off_a0 = (tid & 15) * 4;
+            const int ks_w = tid >> 3, off_w = (tid & 7) * 8;
+            float* ad = asc + st * 4 * BT;
+            __half* wd = wsc + st * 4 * BR;
+            if (kb + ks_a0 < p.k_blocks && tok0 + off_a0 < p.ntok)
+                cp16(ad + ks_a0 * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0) * p.a_sc_ld + tok0 + off_a0);
+            if (kb + ks_a0 + 2 < p.k_blocks && tok0 + off_a0 < p.ntok)
+                cp16(ad + (ks_a0 + 2) * BT + off_a0, p.a_scale + (int64_t) (kb + ks_a0 + 2) * p.a_sc_ld + tok0 + off_a0);
+            if (kb + ks_w < p.k_blocks && row0 + off_w < seg.rows)
+                cp16(wd + ks_w * BR + off_w, seg.w_scale + (int64_t) (kb + ks_w) * seg.w_sc_ld + row0 + off_w);
+        }
+        cp_commit();
+    };
+
+    float acc[MT][MR][4] = {};
+    if (p.k_tiles > 0) stage(0);
+
+    const auto run_kt = [&]<int NKS>(int kt) {
+        const bool more = kt + 1 < p.k_tiles;
+        if (more) stage(kt + 1);
+        if (more) cp_wait<1>(); else cp_wait<0>();
+        __syncthreads();
+        if (consumer) {
+        const int st = kt & 1;
+        const unsigned char* as = act + st * BT * BK;
+        const unsigned char* ws = wt + st * BR * BK;
+        const float* a_sc = asc + st * 4 * BT;
+        const __half* w_sc = wsc + st * 4 * BR;
+        unsigned af[2][MT][4], bf[2][MR][2];
+        auto ld = [&](int ks, unsigned (&a)[MT][4], unsigned (&b)[MR][2]) {
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt)
+                ldsm4(a[mt][0], a[mt][1], a[mt][2], a[mt][3], su(as + sw(wtk * WTOK + mt * 16 + a_row, ks * 32 + a_col)));
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr)
+                ldsm2(b[mr][0], b[mr][1], su(ws + sw(wrw * WROW + mr * 8 + b_row, ks * 32 + b_col)));
+        };
+        ld(0, af[0], bf[0]);
+#pragma unroll
+        for (int ks = 0; ks < NKS; ++ks) {
+            const int sl = ks & 1;
+            if constexpr (NKS > 1) { if (ks + 1 < NKS) ld(ks + 1, af[sl ^ 1], bf[sl ^ 1]); }
+            float2 db[MR];
+            const __half* wr = w_sc + ks * BR + r_off;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) db[mr] = __half22float2(*reinterpret_cast<const __half2*>(wr + mr * 8));
+            const float* ar = a_sc + ks * BT + t_off;
+#pragma unroll
+            for (int mt = 0; mt < MT; ++mt) {
+                const float da0 = ar[mt * 16], da1 = ar[mt * 16 + 8];
+#pragma unroll
+                for (int mr = 0; mr < MR; ++mr) {
+                    int c0, c1, c2i, c3;
+                    mma_s8(c0, c1, c2i, c3, af[sl][mt][0], af[sl][mt][1], af[sl][mt][2], af[sl][mt][3],
+                           bf[sl][mr][0], bf[sl][mr][1]);
+                    acc[mt][mr][0] = fmaf((float) c0, da0 * db[mr].x, acc[mt][mr][0]);
+                    acc[mt][mr][1] = fmaf((float) c1, da0 * db[mr].y, acc[mt][mr][1]);
+                    acc[mt][mr][2] = fmaf((float) c2i, da1 * db[mr].x, acc[mt][mr][2]);
+                    acc[mt][mr][3] = fmaf((float) c3, da1 * db[mr].y, acc[mt][mr][3]);
+                }
+            }
+        }
+        }
+        __syncthreads();
+    };
+
+    for (int kt = 0; kt < full_kt; ++kt) run_kt.template operator()<4>(kt);
+    if (full_kt < p.k_tiles) run_kt.template operator()<2>(full_kt);
+
+    if (consumer) {
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+#pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int tk = tok0 + t_off + mt * 16 + h * 8;
+            if (tk >= p.ntok) continue;
+            float* orow = seg.dst + (int64_t) tk * seg.ld;
+#pragma unroll
+            for (int mr = 0; mr < MR; ++mr) {
+                const int r = row0 + r_off + mr * 8;
+                if (r < seg.rows) {
+                    float2* dst = reinterpret_cast<float2*>(orow + r);
+                    if (p.epi == (int) Epilogue::Add) {
+                        float2 v = *dst;
+                        v.x += acc[mt][mr][2 * h];
+                        v.y += acc[mt][mr][2 * h + 1];
+                        *dst = v;
+                    } else {
+                        *dst = make_float2(acc[mt][mr][2 * h], acc[mt][mr][2 * h + 1]);
+                    }
+                }
+            }
+        }
+    }
+    }
+}
+#endif  // BASALT_ADA
 
 __global__ void quantize_q8_planes_vec4_kernel(const float* __restrict__ x, int64_t rows, int64_t cols, int64_t ld,
                                                int64_t sc_ld, int8_t* __restrict__ codes, float* __restrict__ scales) {
@@ -456,6 +652,7 @@ __global__ void transpose_scales_kernel(const uint16_t* __restrict__ src, int64_
 
 size_t scale_off(int64_t rows, int64_t cols) { return ((size_t) rows * (size_t) cols + 15) & ~size_t(15); }
 
+#if !defined(BASALT_ADA)
 using EncodeFn = CUresult (*)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*,
                               const cuuint64_t*, const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave,
                               CUtensorMapSwizzle, CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
@@ -489,6 +686,7 @@ void tmap(TmaDesc* out, const void* base, int64_t rows, int64_t cols, int box_ro
     }
     std::memcpy(out, &m, sizeof m);
 }
+#endif  // !BASALT_ADA
 
 }  // namespace
 
@@ -549,7 +747,9 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     cudaGetDevice(&dev);
     if (dev >= 0 && dev < 64 && !configured[dev].load(std::memory_order_acquire)) {
         cudaFuncSetAttribute(gemm_64x64_ws_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<64, 64>());
+#if !defined(BASALT_ADA)
         cudaFuncSetAttribute(gemm_128x128_u16_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes<128, 128>());
+#endif
         configured[dev].store(true, std::memory_order_release);
     }
     int tiles_128 = 0;
@@ -565,16 +765,30 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
         tiles_128 += (int) ((s.rows + 127) / 128);
     }
     const int tok_128 = (int) ((rows + 127) / 128);
+#if defined(BASALT_ADA)
+    // Ada has no TMA, so the 128x128 TMA kernel is not built; the 64x64 cp.async kernel covers every shape.
+    const bool use_128 = false;
+#else
     const bool use_128 = (rows >= 1024 && tiles_128 >= 32 && tok_128 * tiles_128 >= 800);
+#endif
     const int bt = use_128 ? 128 : 64;
     const int br = use_128 ? 128 : 64;
 
     Args p{};
+#if defined(BASALT_ADA)
+    // The Ada kernels read the raw codes directly; the descriptor slots are unused.
+    p.act_codes = static_cast<const int8_t*>(act);
+    for (int i = 0; i < nseg; ++i) p.w_codes[i] = seg[i].w;
+    p.w_cols = (int) w_cols;
+#else
     tmap(&p.tm[0], act, rows, w_cols, bt);
+#endif
     int tiles = 0;
     for (int i = 0; i < nseg; ++i) {
         const Segment& s = seg[i];
+#if !defined(BASALT_ADA)
         tmap(&p.tm[1 + i], s.w, s.rows, w_cols, br);
+#endif
         p.seg[i] = {reinterpret_cast<const __half*>(s.w_scales_t), s.dst, s.ld_dst, (int) s.rows,
                     (int) scale_plane_ld(s.rows), tiles};
         tiles += (int) ((s.rows + br - 1) / br);
@@ -590,7 +804,9 @@ void gemm_segmented(const Segment* seg, int nseg, int64_t w_cols, const void* ac
     p.epi = (int) epi;
     const unsigned grid = (unsigned) (p.tok_tiles * p.total_tiles);
     if (use_128) {
+#if !defined(BASALT_ADA)
         gemm_128x128_u16_kernel<<<grid, 512, smem_bytes<128, 128>(), (cudaStream_t) stream>>>(p);
+#endif
     } else {
         gemm_64x64_ws_kernel<<<grid, 160, smem_bytes<64, 64>(), (cudaStream_t) stream>>>(p);
     }
