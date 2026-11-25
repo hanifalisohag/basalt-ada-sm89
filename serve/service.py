@@ -758,16 +758,20 @@ class Service:
         finally:
             self.fifo.release()
 
-    def start_idle_unload(self):
+    def start_idle_unload(self, unloader=None):
+        """Unload the model after idle_unload_s; `unloader(idle_for=...)` defaults to `self.unload`."""
         if not self.idle_unload_s or not hasattr(self.engine, "unload"):
             return
         print(f"[server] model unloads after {self.idle_unload_s} s idle", flush=True)
+        unload = unloader or self.unload
 
         def loop():
-            while True:
+            while not self.stopping.is_set():
                 time.sleep(max(1.0, min(30.0, self.idle_unload_s / 4)))
+                if self.stopping.is_set():
+                    return
                 try:
-                    self.unload(idle_for=self.idle_unload_s)
+                    unload(idle_for=self.idle_unload_s)
                 except EngineStuck as e:                # retried next turn
                     print(f"[server] warning: idle unload failed ({e})", flush=True)
         threading.Thread(target=loop, daemon=True).start()
@@ -1667,8 +1671,9 @@ class Service:
                                     break
                                 if budget and parser.state == "reasoning":
                                     thought += 1
-                                    # only at a clean point: no held tag or split character
-                                    if thought >= budget and not parser.buf and not detok.pending():
+                                    # only at a clean point: no held tag or split character; let a budget-capped pass drain its own DONE/BDONE
+                                    if thought >= budget and not parser.buf and not detok.pending() \
+                                            and not (capped and n - n_pass0 >= cap):
                                         wrap = True
                                         break
                                 if live is not None:
