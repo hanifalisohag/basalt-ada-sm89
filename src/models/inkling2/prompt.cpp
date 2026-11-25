@@ -814,7 +814,9 @@ private:
     }
     bool mxfp8_shape() const {
 #if defined(BASALT_ADA)
-        return false;   // the MXFP8 block-scaled mma is sm_120a; the MMQ path below runs instead
+        // The MXFP8 block-scaled mma is sm_120a only. MMQ has no MXFP8 tile either, so an MX8 pack cannot load on
+        // Ada: init_lane's ready() refuses type 46. The DQ8 pack is the one to run here.
+        return false;
 #else
         return g_.n_embd % 128 == 0 && g_.n_ff_exp % 128 == 0 && g_.n_expert <= 1024;
 #endif

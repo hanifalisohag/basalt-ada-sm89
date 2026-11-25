@@ -50,8 +50,12 @@ hf download jesdga/Qwen3.8-27B-Basalt Qwen3.8-27B-QUASAR-NVFP4.basalt --local-di
 
 The pack is one file, `Inkling-2-Mini-NVFP4-DQ8.basalt` (19.7 GB). It needs about 16.2 GiB of VRAM on the card, so it fits an
 RTX 4090 (24 GB) with room for the context.
-- The New Default:
-  - The MX8 `Inkling-2-Mini-NVFP4-MX8.basalt` file reads prompts about 5% faster on the card
+
+**Use the DQ8 pack on sm_89.** The MX8 pack (`Inkling-2-Mini-NVFP4-MX8.basalt`, 19.6 GB) stores its experts as MXFP8, which
+this fork runs only on Blackwell: the MXFP8 block-scaled tensor-core kernel is sm_120a, and the portable MMQ path has no
+MXFP8 tile, so an MX8 pack **fails to load on sm_89** with `the prompt path's MMQ has no tile for type 46 at 2304 rows`.
+Upstream reads prompts about 5% faster with MX8 on a Blackwell card; that does not apply here. The `hf download` line for it
+is kept below for a Blackwell machine.
 
 ### Run
 
@@ -75,6 +79,13 @@ The repo ships `basalt_config.json`, which names the pack, the card, the context
 
 ```sh
 bin/basalt serve --config basalt_config.json --python .venv/Scripts/python.exe
+```
+
+The repo also ships `basalt_config_mx8.json`, the same settings pointed at the MX8 pack. It is for a Blackwell (sm_120)
+machine: on sm_89 the MX8 pack does not load (see [Get the pack](#get-the-pack)).
+
+```sh
+bin/basalt serve --config basalt_config_mx8.json --python .venv/Scripts/python.exe
 ```
 
 Model paths in the file are relative to the file itself. The server listens on 127.0.0.1:8080 and speaks the OpenAI and

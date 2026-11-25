@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "models": [
+    {
+      "model": "models/Inkling-2-Mini-Basalt/Inkling-2-Mini-NVFP4-MX8.basalt",
+      "gpu": "0",
+      "max-context": 589824,
+      "kv": "fp8",
+      "vision": "dynamic"
+    }
+  ],
+  "engine": {
+    "vram-reserve-mib": 700,
+    "ram-reserve-mib": 1024,
+    "fit-max-tokens": true,
+    "resident-budget-gib": 8.5
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8080
+  }
+}
